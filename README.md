@@ -10,16 +10,26 @@
 ```powershell
 cd "F:\实习简历相关\七牛云项目-语音输入法"
 $env:Path = "F:\software\python;F:\software\python\Scripts;" + $env:Path
-$env:HF_ENDPOINT = "https://hf-mirror.com"   # 国内下载模型镜像
 
 .\.venv\Scripts\python.exe demo_asr.py
 ```
 
-指定音频文件：
+脚本会自动使用国内镜像下载模型；默认 `--model base`（约 145MB，识别更准确）。
+
+指定音频 / 更小模型：
 
 ```powershell
-.\.venv\Scripts\python.exe demo_asr.py your_audio.wav --model base
+.\.venv\Scripts\python.exe demo_asr.py your_audio.wav --model tiny
 ```
+
+### 下载模型超时（ConnectTimeout）
+
+1. **先用 tiny（推荐）**：`python demo_asr.py --model tiny`（本地通常已有缓存）
+2. **手动设镜像**：
+   ```powershell
+   $env:HF_ENDPOINT = "https://hf-mirror.com"
+   .\.venv\Scripts\python.exe demo_asr.py --model base
+   ```
 
 当前 Demo 使用 **faster-whisper**（本地离线模型），验证「音频 → 文字」链路。
 
@@ -36,3 +46,7 @@ $env:HF_ENDPOINT = "https://hf-mirror.com"   # 国内下载模型镜像
 | 增值 | 长语音转写 | 七牛 LASR 异步转写 |
 
 **一句话：Demo 只完成了 ASR；输入法 = 实时采集 + 流式识别 + 全局上屏。**
+
+
+迭代过程
+1、更换模型
