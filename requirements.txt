@@ -2,3 +2,4 @@ faster-whisper>=1.1.0
 numpy>=1.26.0
 soundfile>=0.12.1
 pyttsx3>=2.90
+sounddevice>=0.5.0

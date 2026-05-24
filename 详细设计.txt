@@ -1,0 +1,560 @@
+================================================================================
+                    语音输入法产品 — 详细设计文档
+================================================================================
+版本：v1.0
+日期：2026-05-23
+项目：七牛云项目-语音输入法
+依据：需求分析.txt v1.0、概念设计.txt v1.0
+文档目的：描述模块内部实现、数据结构、接口协议与流程细节（How）
+
+================================================================================
+一、技术选型（MVP）
+================================================================================
+
+  层次          选型                    说明
+  ─────────────────────────────────────────────────────────────────
+  客户端语言    Python 3.12             与现有 Demo 一致，迭代快
+  UI 框架       PyQt6 / Tkinter         悬浮窗 + 托盘；MVP 可用 Tk
+  音频采集      sounddevice             跨平台，支持 16k PCM
+  VAD           webrtcvad / silero-vad  轻量端侧静音检测
+  热键          pynput / keyboard       全局快捷键
+  文本插入      pynput + pyperclip      键盘模拟 + 剪贴板备选
+  通信          websockets / aiohttp    流式 ASR + REST
+  后端          FastAPI (Python)        WebSocket 代理 + REST API
+  配置存储      JSON 本地文件           MVP；后期可 SQLite
+  日志          logging + 文件轮转      按 session_id 追踪
+
+  目录结构（目标）：
+    voice-ime/
+    ├── client/
+    │   ├── main.py                 入口
+    │   ├── orchestrator.py         会话编排
+    │   ├── audio/capture.py        采集
+    │   ├── audio/vad.py            VAD
+    │   ├── asr/base.py             ASR 抽象
+    │   ├── asr/aliyun.py           阿里实现
+    │   ├── input/inserter.py       上屏
+    │   ├── input/commands.py       语音命令
+    │   ├── postprocess/pipeline.py 后处理
+    │   ├── ui/overlay.py           悬浮窗
+    │   ├── ui/tray.py              托盘
+    │   └── config/store.py         配置
+    ├── server/
+    │   ├── main.py
+    │   ├── ws_proxy.py
+    │   └── auth.py
+    ├── demo_asr.py                 现有 Demo（保留）
+    └── tests/audio/                测试音频
+
+
+================================================================================
+二、核心数据结构
+================================================================================
+
+2.1 配置 Config（config.json）
+
+  {
+    "hotkey": "win+shift+v",
+    "input_mode": "push_to_talk",       // push_to_talk | continuous
+    "insert_mode": "keyboard",          // keyboard | clipboard
+    "microphone_device": null,          // null = 系统默认
+    "asr_provider": "aliyun",
+    "backend_url": "wss://api.example.com/ws/asr",
+    "backend_token": "<encrypted or empty>",
+    "language": "zh",
+    "simplified_prompt": "以下是普通话的句子。",
+    "vad_aggressiveness": 2,            // 0~3
+    "chunk_ms": 200,
+    "hotwords": ["七牛云", "语音输入法"],
+    "enable_postprocess": true,
+    "enable_voice_commands": true,
+    "overlay_enabled": true
+  }
+
+2.2 会话 SessionContext
+
+  @dataclass
+  class SessionContext:
+      session_id: str              # UUID，全链路日志关联
+      started_at: float            # time.monotonic()
+      state: SessionState          # 枚举见 2.3
+      partial_text: str            # 当前预览文本
+      final_segments: list[str]    # 已确认分段
+      audio_frames_sent: int       # 已发送帧数（统计/计费）
+      error: Optional[str]
+
+2.3 会话状态 SessionState
+
+  IDLE = "idle"
+  RECORDING = "recording"
+  RECOGNIZING = "recognizing"
+  FLUSHING = "flushing"            # 松手后等待 ASR 收尾
+  INSERTING = "inserting"
+  ERROR = "error"
+
+2.4 ASR 事件 ASREvent
+
+  {
+    "type": "partial" | "final" | "error" | "ready",
+    "text": "识别文本",
+    "start_ms": 0,
+    "end_ms": 2500,
+    "confidence": 0.95,            // 可选
+    "session_id": "uuid",
+    "seq": 12                      // 序号，防乱序
+  }
+
+2.5 热词 HotwordEntry
+
+  {
+    "word": "七牛云",
+    "weight": 10                     // 1~100，供应商格式适配层转换
+  }
+
+
+================================================================================
+三、模块详细设计
+================================================================================
+
+3.1 InputOrchestrator（会话编排器）
+────────────────────────────────────────────────────────────────
+
+  职责：协调一次语音输入的完整生命周期，维护 SessionContext 状态机。
+
+  类接口：
+    class InputOrchestrator:
+        def __init__(self, config, audio, vad, asr, postprocess,
+                     commands, inserter, ui, logger)
+        def on_hotkey_down(self) -> None      # 快捷键按下
+        def on_hotkey_up(self) -> None        # 快捷键松开
+        def start(self) -> None               # 初始化后台线程
+        def stop(self) -> None                # 退出清理
+
+  内部流程 — on_hotkey_down：
+    1. 若 state != IDLE，忽略或先 cancel 上一会话
+    2. 创建 SessionContext，state = RECORDING
+    3. ui.show_recording()
+    4. audio.start(callback=on_audio_frame)
+    5. asr.connect(session_id)
+    6. state = RECOGNIZING
+
+  内部流程 — on_audio_frame(pcm_bytes)：
+    1. 若 vad.is_speech(pcm_bytes) 为 False，跳过（不上传）
+    2. asr.send_audio(pcm_bytes)
+    3. ctx.audio_frames_sent += 1
+
+  内部流程 — on_asr_partial(text)：
+    1. ctx.partial_text = postprocess.preview(text)
+    2. ui.update_preview(ctx.partial_text)
+
+  内部流程 — on_asr_final(text)：
+    1. processed = postprocess.finalize(text)
+    2. action = commands.parse(processed)   # 普通文本 | 命令
+    3. 若命令：inserter.execute(action)
+       否则：inserter.insert_text(action.text); ctx.final_segments.append(...)
+    4. ctx.partial_text = ""
+    5. ui.update_preview("")
+
+  内部流程 — on_hotkey_up：
+    1. audio.stop()
+    2. state = FLUSHING
+    3. asr.finish()                         # 发送结束信号
+    4. 等待 final 或超时（默认 3s）
+    5. state = IDLE and INSERTING → IDLE
+    6. ui.hide_recording()
+
+  超时与错误：
+    - ASR 连接失败：重试 3 次，间隔 1s/2s/4s
+    - 3s 无 final：使用最后 partial 兜底上屏（可配置）
+    - 麦克风占用：ui.show_error("麦克风被占用")
+
+
+3.2 AudioCapture（音频采集）
+────────────────────────────────────────────────────────────────
+
+  参数：
+    sample_rate = 16000
+    channels = 1
+    dtype = int16
+    blocksize = int(sample_rate * chunk_ms / 1000)   # 200ms → 3200 samples
+
+  类接口：
+    class AudioCapture:
+        def list_devices(self) -> list[DeviceInfo]
+        def start(self, on_frame: Callable[[bytes], None]) -> None
+        def stop(self) -> None
+
+  实现要点：
+    - 使用 sounddevice InputStream，callback 模式
+    - callback 内只做 bytes 转换，不做阻塞 IO
+    - 帧格式：raw PCM little-endian int16
+
+
+3.3 VoiceActivityDetector（VAD）
+────────────────────────────────────────────────────────────────
+
+  类接口：
+    class VoiceActivityDetector:
+        def __init__(self, sample_rate=16000, aggressiveness=2)
+        def is_speech(self, pcm_frame: bytes) -> bool
+        def reset(self) -> None
+
+  实现（webrtcvad）：
+    - 帧长必须 10/20/30 ms；200ms 块切分为 20ms × 10 帧
+    - 任一致帧为 speech 则该 chunk 上传（减少漏字）
+    - 或：≥ 30% 帧为 speech 才上传（更省流量，可配置）
+
+  参数建议：
+    chunk_ms=200, frame_ms=20, speech_ratio_threshold=0.1
+
+
+3.4 ASRClient 抽象层与阿里云实现
+────────────────────────────────────────────────────────────────
+
+  3.4.1 抽象基类 asr/base.py
+
+    class ASRProvider(ABC):
+        @abstractmethod
+        async def connect(self, session_id: str, options: ASROptions) -> None
+        @abstractmethod
+        async def send_audio(self, pcm: bytes) -> None
+        @abstractmethod
+        async def finish(self) -> None
+        @abstractmethod
+        async def close(self) -> None
+
+        # 回调注册
+        on_partial: Callable[[str], None]
+        on_final: Callable[[str], None]
+        on_error: Callable[[Exception], None]
+
+  3.4.2 ASROptions
+
+    @dataclass
+    class ASROptions:
+        language: str = "zh"
+        sample_rate: int = 16000
+        hotwords: list[str] = field(default_factory=list)
+        enable_punctuation: bool = True
+        format: str = "pcm"
+
+  3.4.3 经后端代理的 WebSocket 协议（客户端 ↔ 后端）
+
+    连接：wss://{host}/ws/asr?token={jwt}
+
+    客户端 → 服务端（Text JSON）：
+      开始：
+        {"action":"start","session_id":"uuid","options":{...}}
+      结束：
+        {"action":"finish","session_id":"uuid"}
+      心跳：
+        {"action":"ping"}
+
+    客户端 → 服务端（Binary）：
+      原始 PCM 帧，无封装头
+
+    服务端 → 客户端（Text JSON）：
+      {"type":"partial","text":"你好","seq":1}
+      {"type":"final","text":"你好，世界。","seq":2}
+      {"type":"error","code":"ASR_TIMEOUT","message":"..."}
+      {"type":"ready"}
+
+  3.4.4 后端 ws_proxy 职责
+    - 校验 JWT
+    - 建立到阿里云 fun-asr-realtime 的上游 WebSocket
+    - 双向转发音频与文本
+    - 记录 session 时长（用量）
+    - 限流：单用户并发 session ≤ 1，每分钟 chunk 上限
+
+
+3.5 PostProcessor（后处理管道）
+────────────────────────────────────────────────────────────────
+
+  管道顺序（可配置）：
+    raw_text
+      → trim_whitespace
+      → apply_simplified_prompt_effect（已在 ASR 层）
+      → normalize_numbers（Phase 2）
+      → normalize_punctuation（Phase 2）
+      → remove_filler_words（嗯、啊，可选）
+
+  类接口：
+    class PostProcessor:
+        def preview(self, text: str) -> str    # partial 预览用，轻量
+        def finalize(self, text: str) -> str     # final 上屏用，完整管道
+
+  MVP：preview 与 finalize 均可直接返回 strip 后文本
+
+
+3.6 CommandParser（语音命令）
+────────────────────────────────────────────────────────────────
+
+  命令表（Phase 2，MVP 可 stub）：
+    口令            动作                上屏行为
+    ─────────────────────────────────────────────────
+    "换行"          INSERT_NEWLINE      发送 Enter
+    "删除"          DELETE_LAST         发送 Backspace×N 或 Ctrl+Z
+    "逗号"          INSERT_CHAR         插入 ，
+    "句号"          INSERT_CHAR         插入 。
+    "问号"          INSERT_CHAR         插入 ？
+
+  类接口：
+    @dataclass
+    class CommandAction:
+        kind: Literal["text","newline","delete","char"]
+        text: str = ""
+
+    class CommandParser:
+        def parse(self, text: str) -> CommandAction
+
+  匹配规则：final 文本完全等于命令词，或「命令词。」形式
+
+
+3.7 TextInserter（文本上屏）
+────────────────────────────────────────────────────────────────
+
+  类接口：
+    class TextInserter:
+        def __init__(self, mode: Literal["keyboard","clipboard"])
+        def insert_text(self, text: str) -> None
+        def insert_newline(self) -> None
+        def delete_chars(self, n: int) -> None
+        def execute(self, action: CommandAction) -> None
+
+  keyboard 模式实现：
+    - 使用 pynput.keyboard.Controller
+    - 中文：逐字 type 或使用 pyperclip 粘贴（中文兼容性更好）
+    - 推荐：中文文本用 clipboard 粘贴，英文/数字用 type
+    - 粘贴流程：备份剪贴板 → 写入文本 → Ctrl+V → 恢复剪贴板
+
+  焦点保持：
+    - 按下快捷键前记录 hwnd（Win32 GetForegroundWindow）
+    - 上屏前 SetForegroundWindow 还原焦点（若被悬浮窗抢走）
+
+  防重复：同 session 同一 final 文本不重复插入（hash 去重）
+
+
+3.8 OverlayUI（悬浮窗）
+────────────────────────────────────────────────────────────────
+
+  布局（概念）：
+    ┌──────────────────────────────────────┐
+    │  ● 录音中          [====音量====]   │
+    │  你好，这是语音输入法…（实时预览）    │
+    └──────────────────────────────────────┘
+
+  状态展示：
+    IDLE        隐藏或半透明待命
+    RECORDING   红点闪烁 + 音量条
+    RECOGNIZING 预览文字滚动更新
+    ERROR       红色错误提示 3s 自动消失
+
+  位置：屏幕底部居中，always on top，不抢焦点（WS_EX_NOACTIVATE）
+
+
+3.9 TrayApp（系统托盘）
+────────────────────────────────────────────────────────────────
+
+  菜单项：
+    - 开始/停止服务
+    - 设置…
+    - 用量统计（Phase 3）
+    - 关于
+    - 退出
+
+  双击托盘：打开设置窗口
+
+
+3.10 ConfigStore（配置管理）
+────────────────────────────────────────────────────────────────
+
+  路径：%APPDATA%/VoiceIME/config.json
+
+  类接口：
+    class ConfigStore:
+        def load(self) -> Config
+        def save(self, config: Config) -> None
+        def watch(self, callback) -> None    # 热更新（可选）
+
+  默认值合并：文件缺失字段用 DEFAULT_CONFIG 填充
+
+
+3.11 BackendClient（REST）
+────────────────────────────────────────────────────────────────
+
+  POST   /api/v1/auth/login          登录获取 token
+  GET    /api/v1/hotwords            拉取热词
+  PUT    /api/v1/hotwords            更新热词
+  GET    /api/v1/usage/monthly       本月用量
+  POST   /api/v1/transcribe/long     提交长转写（七牛 LASR）
+  GET    /api/v1/transcribe/{taskId} 查询长转写结果
+
+
+================================================================================
+四、关键时序（Detailed Sequence）
+================================================================================
+
+4.1 正常输入时序
+
+  User    Hotkey   Orchestrator   Audio   VAD   ASR    UI    Inserter
+   │        │           │           │      │     │      │        │
+   │─down──►│           │           │      │     │      │        │
+   │        │─down─────►│           │      │     │      │        │
+   │        │           │─start────►│      │     │      │        │
+   │        │           │─connect──────────────────►│      │        │
+   │        │           │           │─frame►│     │      │        │
+   │        │           │           │      │─yes─►│send  │        │
+   │        │           │◄─partial──────────────────│      │        │
+   │        │           │─preview──────────────────────────►│        │
+   │        │           │◄─final─────────────────────│      │        │
+   │        │           │─insert──────────────────────────────────►│
+   │─up────►│           │           │      │     │      │        │
+   │        │─up───────►│           │      │     │      │        │
+   │        │           │─stop─────►│      │     │      │        │
+   │        │           │─finish───────────────────►│      │        │
+   │        │           │◄─final─────────────────────│      │        │
+   │        │           │─insert──────────────────────────────────►│
+
+4.2 网络断开时序
+
+  ASR on_error → Orchestrator.state = ERROR
+               → ui.show_error("网络连接失败，请检查网络")
+               → asr.close(); audio.stop()
+               → 3s 后 state = IDLE
+
+
+================================================================================
+五、后端详细设计（FastAPI）
+================================================================================
+
+5.1 WebSocket 端点 /ws/asr
+
+  依赖：verify_jwt(token)
+
+  伪代码：
+    @app.websocket("/ws/asr")
+    async def asr_ws(websocket, token: str):
+        user = verify_jwt(token)
+        await websocket.accept()
+        upstream = await connect_aliyun_asr(user.hotwords)
+        try:
+            async for msg in websocket.iter():
+                if isinstance(msg, bytes):
+                    await upstream.send_audio(msg)
+                else:
+                    data = json.loads(msg)
+                    if data["action"] == "start":
+                        await upstream.start(data["options"])
+                    elif data["action"] == "finish":
+                        await upstream.finish()
+            async for result in upstream.results():
+                await websocket.send_json(result)
+                if result["type"] == "final":
+                    usage.record(user.id, duration)
+        finally:
+            await upstream.close()
+
+5.2 鉴权
+  - MVP：单用户 API Token（环境变量）
+  - 正式：JWT，exp=24h，refresh token
+
+5.3 长转写 POST /api/v1/transcribe/long
+
+  Request:
+    {"audio_url": "https://...", "callback": "optional"}
+  Response:
+    {"task_id": "xxx"}
+  内部：调用七牛 LASR API，task_id 映射入库
+
+
+================================================================================
+六、线程与并发模型
+================================================================================
+
+  线程/任务              职责                    阻塞要求
+  ─────────────────────────────────────────────────────────────
+  主线程 (UI)            Tk/Qt 事件循环           不阻塞
+  热键监听线程           pynput 回调              仅发事件到队列
+  编排器线程             消费 EventQueue          协调各模块
+  音频 callback          sounddevice 回调         极短，仅入队 PCM
+  ASR asyncio loop       WebSocket IO             独立线程跑 loop
+
+  模块间通信：threading.Queue / asyncio.Queue
+  事件类型：HotkeyDown, HotkeyUp, AudioFrame, ASRPartial, ASRFinal, Error
+
+
+================================================================================
+七、错误码与处理
+================================================================================
+
+  错误码              场景                    用户提示
+  ─────────────────────────────────────────────────────────────
+  MIC_NOT_FOUND       无麦克风设备            请连接麦克风
+  MIC_BUSY            设备被占用              麦克风被其他程序占用
+  ASR_CONNECT_FAIL    WS 连接失败             无法连接语音服务
+  ASR_TIMEOUT         收尾超时                识别超时，请重试
+  INSERT_FAIL         上屏失败                无法写入当前应用，尝试剪贴板模式
+  AUTH_FAIL           Token 无效              请重新登录
+  QUOTA_EXCEEDED      用量超限                本月用量已达上限
+
+  日志格式：
+    [2026-05-23 10:00:01] [session=abc-123] [INFO] ASR connected
+    [2026-05-23 10:00:03] [session=abc-123] [ERROR] ASR_TIMEOUT
+
+
+================================================================================
+八、测试设计
+================================================================================
+
+  8.1 单元测试
+    - VAD：静音/语音 PCM 样本断言
+    - PostProcessor：输入输出文本对
+    - CommandParser：命令词表覆盖
+    - ConfigStore：读写与默认值合并
+
+  8.2 集成测试
+    - MockASRProvider：回放 preset partial/final 序列
+    - 音频文件 → AudioCapture 模拟 → 完整会话 → 断言 inserter 收到文本
+
+  8.3 端到端测试
+    - samples/demo.wav 通过 file-source 注入
+    - 记事本自动化：识别后断言窗口文本内容
+
+  8.4 性能测试
+    - 首 partial 延迟 P95 < 500ms（局域网 + 云端 ASR）
+    - 连续 20 会话无内存泄漏（memory_profiler）
+
+
+================================================================================
+九、安全设计细节
+================================================================================
+
+  - Token 存储：Windows DPAPI 加密后写 config，或仅内存持有
+  - WSS 强制 TLS 1.2+
+  - 后端不持久化音频；仅记 session 时长与 error
+  - 日志脱敏：不记录识别文本（可配置 debug 模式）
+  - 更新：EXE 签名校验（正式发布）
+
+
+================================================================================
+十、MVP 交付清单（开发任务分解）
+================================================================================
+
+  序号  任务                              预估    依赖
+  ─────────────────────────────────────────────────────────
+  T1    项目骨架 + ConfigStore            0.5d
+  T2    AudioCapture + VAD                1d
+  T3    MockASRProvider + 单元测试        1d
+  T4    InputOrchestrator 状态机          1.5d
+  T5    HotkeyManager                     0.5d
+  T6    TextInserter（clipboard 模式）    1d
+  T7    OverlayUI + TrayApp               1.5d
+  T8    后端 ws_proxy + 阿里 ASR 对接     2d
+  T9    联调 + samples 回归测试           1d
+  T10   打包 exe（PyInstaller）           0.5d
+                                      ──────
+                                      ~10.5d
+
+================================================================================
+                              文档结束
+================================================================================
