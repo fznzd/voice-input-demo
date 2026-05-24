@@ -22,6 +22,12 @@ $env:Path = "F:\software\python;F:\software\python\Scripts;" + $env:Path
 .\.venv\Scripts\python.exe demo_asr.py your_audio.wav --model tiny
 ```
 
+直接从麦克风录制并识别：
+
+```powershell
+.\.venv\Scripts\python.exe demo_asr.py --mic --duration 10 --save-wav samples\mic_record.wav
+```
+
 ### 下载模型超时（ConnectTimeout）
 
 1. **先用 tiny（推荐）**：`python demo_asr.py --model tiny`（本地通常已有缓存）
