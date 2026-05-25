@@ -63,8 +63,7 @@ $env:Path = "F:\software\python;F:\software\python\Scripts;" + $env:Path
 |------|------|------|
 | ✅ 当前 | 文件/离线识别 | 录完再转，延迟较高 |
 | ✅ 当前 | 麦克风实时采集 | `sounddevice` 录音 + VAD 静音检测 |
-| 下一步 | 流式 ASR | 换云端 WebSocket（如 `fun-asr-realtime`），边说边出字 |
-| 核心 | 文本插入 | 模拟键盘输入，写入 Word/浏览器/微信等 |
+| ✅ 当前| 文本插入 | 模拟键盘输入，写入 Word/浏览器/微信等 |
 | 核心 | 全局快捷键 | 如 `Win+Shift+V` 按住说话 |
 | 体验 | 悬浮 UI | 显示 partial/final 识别结果 |
 | 增值 | 长语音转写 | 七牛 LASR 异步转写 |

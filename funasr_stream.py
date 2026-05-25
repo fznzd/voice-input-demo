@@ -39,7 +39,7 @@ def audio_thread():
 threading.Thread(target=audio_thread, daemon=True).start()
 
 buffer = np.array([], dtype=np.int16)
-print("✅ FunASR 已启动（长窗口2秒），说话试试...\n")
+print("✅ FunASR 已启动（长窗口2秒），说话试试...（按Ctrl+C 停止）\n")
 print("当前识别结果：", end="", flush=True)
 
 try:
