@@ -1,76 +1,66 @@
 # 语音输入法
 
-## 环境
+## 项目简介
 
-- Python：`F:\software\python\python.exe`（3.12.9）
-- 项目虚拟环境：`.venv`
+本项目基于 `funasr_stream_v3.py` 实现一个按住说话的本地语音输入法脚本。
+脚本从麦克风采集音频，按住 `Ctrl` 键录音，松开后调用 `FunASR` 模型识别中文语音，并把识别结果自动粘贴到当前光标所在的应用中。
 
-## 快速运行（语音识别 Demo）
+## 实现功能
 
-```powershell
-cd "F:\实习简历相关\七牛云项目-语音输入法"
-$env:Path = "F:\software\python;F:\software\python\Scripts;" + $env:Path
+- **实时麦克风录音**：按住 `Ctrl` 键开始录音，松开 `Ctrl` 停止录音。
+- **本地语音识别**：使用 `funasr` 的 `AutoModel` 加载中文 ASR 模型进行识别。
+- **文本上屏**：识别结果通过剪贴板和 `pyautogui` 自动粘贴到当前焦点窗口。
+- **按住说话模式**：避免录音时累积过长音频，用户可短按/长按 `Ctrl` 控制录音时长。
+- **自动依赖检查**：程序启动时检查必要库并给出安装提示。
 
-.\.venv\Scripts\python.exe demo_asr.py
-```
+## 依赖库
 
-脚本会自动使用国内镜像下载模型；默认 `--model base`（约 145MB，识别更准确）。
+以下 Python 包是运行 `funasr_stream_v3.py` 所必须的：
 
-指定音频 / 更小模型：
+- `numpy`
+- `pyaudio`
+- `pyautogui`
+- `pyperclip`
+- `keyboard`
+- `funasr`
+- `modelscope`
 
-```powershell
-.\.venv\Scripts\python.exe demo_asr.py your_audio.wav --model tiny
-```
+## 推荐安装方式
 
-直接从麦克风录制并识别：
-
-```powershell
-.\.venv\Scripts\python.exe demo_asr.py --mic --duration 10 --save-wav samples\mic_record.wav
-```
-
-### 下载模型超时（ConnectTimeout）
-
-1. **先用 tiny（推荐）**：`python demo_asr.py --model tiny`（本地通常已有缓存）
-2. **手动设镜像**：
-   ```powershell
-   $env:HF_ENDPOINT = "https://hf-mirror.com"
-   .\.venv\Scripts\python.exe demo_asr.py --model base
-   ```
-
-当前 Demo 使用 **faster-whisper**（本地离线模型），验证「音频 → 文字」链路。
-
-## 麦克风实时采集 + VAD
+请使用本项目对应 Python 解释器或虚拟环境执行安装：
 
 ```powershell
-.\.venv\Scripts\python.exe demo_mic_vad.py --duration 10
+
+python -m pip install numpy pyaudio pyautogui pyperclip keyboard funasr modelscope
+
+
 ```
 
-可选参数：
-
-```powershell
-# 列出麦克风
-.\.venv\Scripts\python.exe demo_mic_vad.py --list-devices
-
-# 仅保存 VAD 判定为语音的片段
-.\.venv\Scripts\python.exe demo_mic_vad.py --duration 5 --save samples\mic_speech.wav
+## 运行方式
+```
+python funasr_stream_v3.py
 ```
 
-模块位置：`client/audio/capture.py`（采集）、`client/audio/vad.py`（静音检测）。
+运行后，程序会：
 
-## 从 Demo 到「输入法」还需要什么
+1. 检查依赖库
+2. 加载 `FunASR` 模型
+3. 打开麦克风采集
+4. 按住 `Ctrl` 开始录音，松开 `Ctrl` 识别并插入文字
 
-| 阶段 | 能力 | 说明 |
-|------|------|------|
-| ✅ 当前 | 文件/离线识别 | 录完再转，延迟较高 |
-| ✅ 当前 | 麦克风实时采集 | `sounddevice` 录音 + VAD 静音检测 |
-| 下一步 | 流式 ASR | 换云端 WebSocket（如 `fun-asr-realtime`），边说边出字 |
-| 核心 | 文本插入 | 模拟键盘输入，写入 Word/浏览器/微信等 |
-| 核心 | 全局快捷键 | 如 `Win+Shift+V` 按住说话 |
-| 体验 | 悬浮 UI | 显示 partial/final 识别结果 |
-| 增值 | 长语音转写 | 七牛 LASR 异步转写 |
+## 注意事项
 
-**一句话：Demo 只完成了 ASR；输入法 = 实时采集 + 流式识别 + 全局上屏。**
+- 模型首次加载会下载模型文件，下载量较大，可能需要等待几分钟。
+- 程序默认使用 `cpu` 设备；如果有 GPU，可将 `funasr_stream_v3.py` 中 `device="cpu"` 修改为 `device="cuda"`。
+- 如果出现 `pyautogui` 或 `keyboard` 等缺少依赖的错误，请根据提示安装对应包。
+- 当前脚本仅支持 Windows 环境，因为 `keyboard` 和 `pyautogui` 的全局按键/粘贴功能在 Windows 上更稳定。
+
+## 目录说明
+菜鸟已经
+- `funasr_stream_v3.py`：主程序，负责录音、识别和文本插入。
+- `model/`：本地模型缓存目录。
+- `modelscope_cache/`：`modelscope` 下载缓存目录。
 
 
-迭代过程
-1、更换模型
+## demo视频链接（与上传视频相同）
+【demo视频】 https://www.bilibili.com/video/BV14WGo6TEbp/?share_source=copy_web&vd_source=1b465bda1d45911e62dd7b40074b3c49
